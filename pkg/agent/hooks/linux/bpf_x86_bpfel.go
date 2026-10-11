@@ -84,6 +84,7 @@ type bpfMapSpecs struct {
 	KeployClientRegistrationMap *ebpf.MapSpec `ebpf:"keploy_client_registration_map"`
 	OrigDstByCookie             *ebpf.MapSpec `ebpf:"orig_dst_by_cookie"`
 	PendingBinds                *ebpf.MapSpec `ebpf:"pending_binds"`
+	PidMapInsertFailures        *ebpf.MapSpec `ebpf:"pid_map_insert_failures"`
 	RedirectProxyMap            *ebpf.MapSpec `ebpf:"redirect_proxy_map"`
 	TargetNamespacePids         *ebpf.MapSpec `ebpf:"target_namespace_pids"`
 }
@@ -123,6 +124,7 @@ type bpfMaps struct {
 	KeployClientRegistrationMap *ebpf.Map `ebpf:"keploy_client_registration_map"`
 	OrigDstByCookie             *ebpf.Map `ebpf:"orig_dst_by_cookie"`
 	PendingBinds                *ebpf.Map `ebpf:"pending_binds"`
+	PidMapInsertFailures        *ebpf.Map `ebpf:"pid_map_insert_failures"`
 	RedirectProxyMap            *ebpf.Map `ebpf:"redirect_proxy_map"`
 	TargetNamespacePids         *ebpf.Map `ebpf:"target_namespace_pids"`
 }
@@ -138,6 +140,7 @@ func (m *bpfMaps) Close() error {
 		m.KeployClientRegistrationMap,
 		m.OrigDstByCookie,
 		m.PendingBinds,
+		m.PidMapInsertFailures,
 		m.RedirectProxyMap,
 		m.TargetNamespacePids,
 	)

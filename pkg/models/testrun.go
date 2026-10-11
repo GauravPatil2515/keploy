@@ -174,6 +174,18 @@ type MockOutcome struct {
 	// with the served and missed calls comfortably up to suites of tens of
 	// thousands of tests.
 	Windows []ScopeWindow `json:"windows,omitempty"`
+	// PIDMapRefusals are the inserts into the agent's PID maps the kernel
+	// refused over its life, which under compose is the replay's: processes
+	// its hooks could not track. nil when it cannot count them, which is
+	// "unknown".
+	PIDMapRefusals *PIDMapRefusals `json:"pidMapRefusals,omitempty"`
+	// PIDMapRefusalsError is why hooks that count those refusals could not be
+	// read as the agent stopped; "" when they were read, or when the hooks do
+	// not count them at all. It is what tells the CLI "the count was lost"
+	// (completeness unproven: --strict fails it) from "this agent never
+	// counts" (an older agent, or hooks without PID maps), which a nil
+	// PIDMapRefusals alone cannot.
+	PIDMapRefusalsError string `json:"pidMapRefusalsError,omitempty"`
 }
 
 // MockSummaryFromSpec builds a protocol-generic summary string from a mock's spec.

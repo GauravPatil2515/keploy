@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -115,7 +116,24 @@ func (a *Agent) readStopOutcome(ctx context.Context) ([]byte, error) {
 	// The windows say which test ran when, and with what verdict; the CLI
 	// cannot ask a stopped agent for them.
 	windows, _ := a.GetScopeWindows(ctx)
-	body, err := json.Marshal(models.MockOutcome{Consumed: consumed, Missed: missed, Windows: windows})
+	outcome := models.MockOutcome{Consumed: consumed, Missed: missed, Windows: windows}
+	// Nor whether its hooks could track every process. Hooks that never count
+	// leave both fields out, which the CLI reads as "unknown" and lets pass.
+	// A count that could not be read leaves its error instead: completeness
+	// is then unproven, which the CLI must be able to tell from "never
+	// counted" (--strict fails it), and the agent says so here too.
+	refusals, err := a.PIDMapRefusals(ctx)
+	switch {
+	case err == nil:
+		outcome.PIDMapRefusals = &refusals
+	case errors.Is(err, models.ErrPIDMapRefusalsUnsupported):
+		a.logger.Debug("these hooks do not count refused PID map inserts; none are left in the replay outcome", zap.Error(err))
+	default:
+		outcome.PIDMapRefusalsError = err.Error()
+		a.logger.Warn("could not read the refused PID map inserts to leave in the replay outcome: keploy cannot prove that every process of the test command was tracked", zap.Error(err),
+			zap.String("next_step", "check this agent's logs for a WARN about its PID map being full"))
+	}
+	body, err := json.Marshal(outcome)
 	if err != nil {
 		return nil, fmt.Errorf("failed to encode the replay outcome: %w", err)
 	}

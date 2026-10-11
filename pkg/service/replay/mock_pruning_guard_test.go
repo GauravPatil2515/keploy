@@ -184,6 +184,20 @@ func TestShouldPrune_WiresTheGuardIntoTheDecision(t *testing.T) {
 			why: "without instrumentation there is no trustworthy consumed-mock set at all",
 		},
 		{
+			name: "a capture-incomplete run never prunes", removeUnusedMocks: true, instrument: true,
+			run:    with(complete(3, 0, healthy), func(r *pruneRun) { r.captureIncomplete = true }),
+			reason: "capture_incomplete",
+			why: "a process the agent could not track made its calls to the real dependency, so the mocks " +
+				"recorded for them look unused although every test passed",
+		},
+		{
+			name: "a capture-unverified run never prunes", removeUnusedMocks: true, instrument: true,
+			run:    with(complete(3, 0, healthy), func(r *pruneRun) { r.captureUnverified = true }),
+			reason: "capture_unverified",
+			why: "the agent counts processes it could not track, but the count could not be read, so nothing " +
+				"shows the consumed-mock set is complete",
+		},
+		{
 			name: "a run that did not score every test never prunes", removeUnusedMocks: true, instrument: true,
 			run:    with(complete(3, 0, healthy), func(r *pruneRun) { r.allTestsGotAVerdict = false }),
 			reason: "not_every_test_got_a_verdict",
