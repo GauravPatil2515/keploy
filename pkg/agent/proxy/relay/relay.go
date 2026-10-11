@@ -150,6 +150,10 @@ type Relay struct {
 	// upstream socket out of order.
 	holdMu sync.Mutex
 
+	// created is when New built the relay (UnixNano): the capture's clock
+	// for a connection that has carried nothing yet (LastCaptured).
+	created int64
+
 	// preDispatchActive is true between [Relay.Run]'s pre-spawn
 	// [installPreDispatchPause] call (gated on
 	// [Config.PreDispatchPause]) and the
@@ -198,6 +202,7 @@ func New(cfg Config, src, dst net.Conn) *Relay {
 		directives: make(chan directive.Directive, 8),
 		acks:       make(chan directive.Ack, 8),
 		order:      connseq.Of(dst),
+		created:    time.Now().UnixNano(),
 	}
 	if r.order == nil {
 		// Every chunk is numbered (fakeconn.ErrUnnumbered), and only the
@@ -674,6 +679,11 @@ func (r *Relay) forward(
 			t.noteReading()
 			chunk.Dir = dir
 			chunk.ReadAt = observedReadAt(src, time.Now())
+			// Noted before it is marked stamped: a chunk in hand that is
+			// stamped has been told of (CapturedTo).
+			if r.cfg.OnCapture != nil {
+				r.cfg.OnCapture(chunk.ReadAt)
+			}
 			t.noteCarried(chunk.ReadAt)
 			if dir == fakeconn.FromClient {
 				chunk.ConnSeq = r.order.FromClient()

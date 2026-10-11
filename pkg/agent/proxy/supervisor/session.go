@@ -202,6 +202,15 @@ type Session struct {
 	// StoppedAt. Set it before the parser runs.
 	OnStop func(at time.Time)
 
+	// CaptureClock, when non-nil, is the capture's clock for this
+	// connection: the stamp of the newest chunk it has carried (when the
+	// relay, or the kernel, read it), in either direction, whether its parser
+	// has got to it or not. StoppedAt dates a stop by it. The dispatcher sets
+	// it to its relay's LastCaptured. nil: the stop is dated by the agent's
+	// clock, which is as far past the connection's traffic as its parser is
+	// behind. Set it before the parser runs.
+	CaptureClock func() time.Time
+
 	// RecordingDone is closed once the recording this connection is captured
 	// for stops: the dispatcher sets it to the Done channel of the recording's
 	// context. It is not the parser's lifetime (Ctx), which also ends when
@@ -234,9 +243,12 @@ type Session struct {
 	endedWithConnection [2]atomic.Bool
 	// endedAtHole, per fakeconn.Direction: that stream ended at a capture
 	// hole, and why (MarkEndedAtHole). nil while it has not.
-	endedAtHole      [2]atomic.Pointer[string]
+	endedAtHole [2]atomic.Pointer[string]
+	// hookMu guards OnMockRecorded's chain and lastReqTimestamp: each is
+	// read and written in a few instructions, never with the other held or a
+	// hook running, so one lock serves both and keeps a Session in its size
+	// class (TestASessionStaysInThe640ByteSizeClass).
 	hookMu           sync.Mutex
-	lastReqMu        sync.Mutex
 	lastReqTimestamp time.Time // most recent ReqTimestampMock emitted on this session
 
 	// incomplete is the incomplete-mock flag (MarkMockIncomplete): nil while
@@ -551,11 +563,68 @@ func (s *Session) manager() *syncMock.SyncMockManager {
 }
 
 // OrphanSpans is where a Session's unrecordable spans go instead of its manager
-// (Session.Orphans). *syncMock.Spans is one.
+// (Session.Orphans). *syncMock.Spans is one, and a CaptureOrphanSpans.
 type OrphanSpans interface {
 	Record(start, end time.Time)
 	Open(start time.Time) func()
 }
+
+// CaptureOrphanSpans is an OrphanSpans that can also open a span on the
+// capture's clock (syncMock.Spans.OpenAt): Session.OpenOrphanSpan uses it.
+// *syncMock.Spans is one.
+type CaptureOrphanSpans interface {
+	OrphanSpans
+	OpenAt(start time.Time, grace time.Duration) *syncMock.OpenSpan
+}
+
+var _ CaptureOrphanSpans = (*syncMock.Spans)(nil)
+
+// OpenOrphanSpan is OpenOrphanWindow on the capture's clock: the span of what
+// the connection carries after it stopped being recorded, from start (its
+// stop, StoppedAt), extended to the stamp of each chunk it carries after and
+// ended at the last one (syncMock.UnrecordedConn on the capture's clock). It
+// routes as OpenOrphanWindow does: to Orphans when set (a CaptureOrphanSpans;
+// one that is not opens a span that extends to its horizon, as
+// OpenOrphanWindow's), else to Session.manager. grace is
+// syncMock.UnrecordedIdleGrace.
+func (s *Session) OpenOrphanSpan(start time.Time, grace time.Duration) syncMock.CaptureSpan {
+	if s == nil {
+		return syncMock.NoSpan
+	}
+	if s.Orphans != nil {
+		return OpenCaptureSpan(s.Orphans, start, grace)
+	}
+	return orNoSpan(s.manager().OpenOrphanSpan(start, grace))
+}
+
+// OpenCaptureSpan opens a span from start on the capture's clock on spans
+// (CaptureOrphanSpans.OpenAt), or, on spans that cannot, one that extends to
+// their horizon, as Open's does. Never nil: NoSpan for a zero start.
+func OpenCaptureSpan(spans OrphanSpans, start time.Time, grace time.Duration) syncMock.CaptureSpan {
+	if spans == nil || start.IsZero() {
+		return syncMock.NoSpan
+	}
+	if c, ok := spans.(CaptureOrphanSpans); ok {
+		return orNoSpan(c.OpenAt(start, grace))
+	}
+	return closerSpan(spans.Open(start))
+}
+
+// orNoSpan is o, or NoSpan for a nil one (a zero start opens none).
+func orNoSpan(o *syncMock.OpenSpan) syncMock.CaptureSpan {
+	if o == nil {
+		return syncMock.NoSpan
+	}
+	return o
+}
+
+// closerSpan is a span opened with Open, as a CaptureSpan: the traffic does
+// not extend it (it extends to its spans' horizon), and its closer ends it
+// there.
+type closerSpan func()
+
+func (closerSpan) Extend(time.Time)  {}
+func (c closerSpan) Close(time.Time) { c() }
 
 // OpenOrphanWindow is the open-ended twin of RecordOrphanWindow, for a hole
 // whose end is not yet known. It routes the same way (Orphans when set, else
@@ -960,9 +1029,16 @@ func (s *Session) ReportStoppedOn(kind models.Kind, reqTs time.Time, reason stri
 
 // StoppedAt is the instant this connection stopped being recorded: the first of
 // the parser's stop on an exchange, its death or retirement, and a capture
-// hole. It is the clock, read once, at the first call, and that same instant
-// at every call after it, from any goroutine; the first call tells OnStop
-// before it returns. Each event calls it as it happens, before it logs
+// hole. It is the capture's clock (CaptureClock: the stamp of the newest chunk
+// the connection had carried), read once, at the first call, and that same
+// instant at every call after it, from any goroutine; the first call tells
+// OnStop before it returns. Every byte the connection had carried by the stop,
+// read by the parser or still buffered behind it and lost with it, is stamped
+// no later, so a span that ends at the stop covers them all; and a parser that
+// is behind its traffic does not widen it by its lag, as the agent's clock
+// does (a stop the agent gets to ten seconds after the traffic was dated ten
+// seconds late, and left out every test case of every healthy connection in
+// between). Without a CaptureClock it is the agent's clock. Each event calls it as it happens, before it logs
 // anything: the parser as it reports the exchange it stops on
 // (ReportStoppedOn, whose span ends at it); the supervisor as it learns that
 // the parser panicked or returned with an error (Supervisor.Run); the
@@ -998,7 +1074,13 @@ func (s *Session) StoppedAt() time.Time {
 	if n := s.stoppedAt.Load(); n != 0 {
 		return time.Unix(0, n)
 	}
-	now := time.Now().UnixNano()
+	stamp := time.Now()
+	if s.CaptureClock != nil {
+		if t := s.CaptureClock(); !t.IsZero() {
+			stamp = t
+		}
+	}
+	now := stamp.UnixNano()
 	if !s.stoppedAt.CompareAndSwap(0, now) {
 		return time.Unix(0, s.stoppedAt.Load())
 	}
@@ -1176,7 +1258,7 @@ func leftOutNextStep(class string, spanned bool) string {
 // s.lastReqTimestamp + 1ns when a regression is detected, and
 // updates the session's last-seen timestamp. In debug builds we
 // panic instead so regressions surface during testing. Thread-safe:
-// holds lastReqMu while comparing + writing back.
+// holds hookMu while comparing + writing back.
 //
 // Zero-valued ReqTimestampMock values pass through untouched
 // (parsers that haven't populated them, e.g. tests with pre-built
@@ -1186,8 +1268,8 @@ func (s *Session) enforceReqMonotonic(m *models.Mock) {
 	if req.IsZero() {
 		return
 	}
-	s.lastReqMu.Lock()
-	defer s.lastReqMu.Unlock()
+	s.hookMu.Lock()
+	defer s.hookMu.Unlock()
 	if s.lastReqTimestamp.IsZero() {
 		s.lastReqTimestamp = req
 		return

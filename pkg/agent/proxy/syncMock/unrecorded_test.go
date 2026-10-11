@@ -4,6 +4,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -656,4 +657,206 @@ func TestSpansOpenAndClosePastTheCapConcurrently(t *testing.T) {
 			t.Fatalf("the span opened at %v is not covered once closed", start)
 		}
 	}
+}
+
+// captureClock is how far a test's capture has got.
+type captureClock struct{ ns atomic.Int64 }
+
+func (c *captureClock) set(t time.Time)          { c.ns.Store(t.UnixNano()) }
+func (c *captureClock) now() time.Time           { return time.Unix(0, c.ns.Load()) }
+func at(t0 time.Time, d time.Duration) time.Time { return t0.Add(d) }
+
+func overlaps(s *Spans, from, to time.Time) bool {
+	ok, _ := s.Overlaps(from, to)
+	return ok
+}
+
+// P20: on the capture's clock a stopped connection's span is the stamps of the
+// chunks it carried: it opens at the stop's stamp, each chunk extends it to its
+// stamp, and once the capture has got the idle grace past the last chunk with
+// none in between it ends at that chunk. The capture here is far in the past,
+// so a span dated by the agent's clock would reach the present.
+func TestUnrecordedConnOnCaptureSpansAreTheChunksStamps(t *testing.T) {
+	var spans Spans
+	var clock captureClock
+	t0 := time.Unix(5000, 0)
+	clock.set(t0)
+	u := NewUnrecordedConnOnCapture(func(s time.Time) CaptureSpan { return spans.OpenAt(s, testIdleGrace) },
+		clock.now, testIdleGrace, testIdleCheck)
+	defer u.End()
+
+	u.Note(t0) // before the stop: recorded traffic, no span
+	if _, open := spans.Counts(); open != 0 {
+		t.Fatal("a span opened before the stop")
+	}
+	u.Stop(t0)
+	u.Note(at(t0, 10*time.Millisecond))
+	clock.set(at(t0, 15*time.Millisecond)) // within the grace of the last chunk
+
+	if !overlaps(&spans, at(t0, 5*time.Millisecond), at(t0, 6*time.Millisecond)) {
+		t.Fatal("the traffic after the stop is not covered")
+	}
+	// Open, it reaches no further than the grace past its last chunk.
+	past := at(t0, 10*time.Millisecond+testIdleGrace+time.Millisecond)
+	if overlaps(&spans, past, past.Add(time.Millisecond)) {
+		t.Fatal("an open span reached past its idle grace")
+	}
+	if overlaps(&spans, time.Now().Add(-time.Millisecond), time.Now()) {
+		t.Fatal("an open span reached the agent's clock")
+	}
+
+	// The capture gets past the grace: it ends at the last chunk.
+	clock.set(at(t0, time.Hour))
+	waitUntil(t, 30*time.Second, "the span to close once the capture passed its grace", func() bool {
+		_, open := spans.Counts()
+		return open == 0
+	})
+	if !overlaps(&spans, at(t0, 10*time.Millisecond), at(t0, 10*time.Millisecond)) {
+		t.Fatal("the closed span does not reach its last chunk")
+	}
+	if overlaps(&spans, at(t0, 11*time.Millisecond), at(t0, 12*time.Millisecond)) {
+		t.Fatal("the closed span reaches past its last chunk")
+	}
+
+	// Traffic after a gap: a span of its own, from its own stamp.
+	u.Note(at(t0, 500*time.Millisecond))
+	if !overlaps(&spans, at(t0, 500*time.Millisecond), at(t0, 500*time.Millisecond)) {
+		t.Fatal("traffic after the gap is not covered")
+	}
+	if overlaps(&spans, at(t0, 200*time.Millisecond), at(t0, 300*time.Millisecond)) {
+		t.Fatal("the gap between the two spells is covered")
+	}
+
+	// The connection ends: its span ends at its last chunk.
+	u.Note(at(t0, 600*time.Millisecond))
+	u.End()
+	if _, open := spans.Counts(); open != 0 {
+		t.Fatal("End left a span open")
+	}
+	if overlaps(&spans, at(t0, 601*time.Millisecond), time.Now()) {
+		t.Fatal("the span of a connection that ended reaches past its last chunk")
+	}
+}
+
+// Idleness is a gap between the capture's stamps, not between the agent's
+// wake-ups: however long the agent waits, a span stays open while the capture
+// has not got the idle grace past its last chunk (a starved capture reader,
+// behind the traffic), and closes only once it has.
+func TestUnrecordedConnOnCaptureIdlenessIsAGapBetweenStamps(t *testing.T) {
+	var spans Spans
+	var clock captureClock
+	t0 := time.Unix(5000, 0)
+	clock.set(t0)
+	u := NewUnrecordedConnOnCapture(func(s time.Time) CaptureSpan { return spans.OpenAt(s, testIdleGrace) },
+		clock.now, testIdleGrace, testIdleCheck)
+	defer u.End()
+	u.Stop(t0)
+	// Many idle graces of the agent's clock, many checks: the capture has
+	// not moved, so the connection is not known to be idle.
+	time.Sleep(10 * testIdleGrace)
+	if _, open := spans.Counts(); open != 1 {
+		t.Fatal("the span closed on the agent's clock while the capture had not got past its grace")
+	}
+	// The starved reader catches up and hands over a chunk from within the
+	// grace: the same span covers it, without a gap.
+	u.Note(at(t0, testIdleGrace/2))
+	clock.set(at(t0, time.Hour))
+	waitUntil(t, 30*time.Second, "the span to close", func() bool {
+		_, open := spans.Counts()
+		return open == 0
+	})
+	if closed, _ := spans.Counts(); closed != 1 {
+		t.Fatalf("%d closed spans, want one: the late chunk within the grace was split off", closed)
+	}
+	if !overlaps(&spans, at(t0, testIdleGrace/4), at(t0, testIdleGrace/4)) {
+		t.Fatal("the stretch up to the late chunk is not covered")
+	}
+}
+
+// An open span on the capture extends to its last chunk, and on to the horizon
+// no further than its grace past it; one opened with Open extends to the
+// horizon, and its closer ends it there. Neither looks at the agent's clock.
+func TestSpansOpenSpansExtendToTheHorizon(t *testing.T) {
+	var s Spans
+	var clock captureClock
+	t0 := time.Unix(5000, 0)
+	s.SetHorizon(clock.now)
+	const grace = time.Second
+
+	o := s.OpenAt(t0, grace)
+	o.Extend(at(t0, time.Second))
+	clock.set(at(t0, 1500*time.Millisecond))
+	if !overlaps(&s, at(t0, 1400*time.Millisecond), at(t0, 1450*time.Millisecond)) {
+		t.Fatal("an open span does not reach the horizon within its grace")
+	}
+	if overlaps(&s, at(t0, 1600*time.Millisecond), at(t0, 1700*time.Millisecond)) {
+		t.Fatal("an open span reaches past the horizon")
+	}
+	clock.set(at(t0, 5*time.Second))
+	if overlaps(&s, at(t0, 2500*time.Millisecond), at(t0, 3*time.Second)) {
+		t.Fatal("an open span reaches past its grace")
+	}
+	o.Close(at(t0, time.Second))
+	o.Close(at(t0, 4*time.Second)) // idempotent: the first close counts
+	if overlaps(&s, at(t0, 1100*time.Millisecond), time.Now()) {
+		t.Fatal("a span closed at its last chunk reaches past it")
+	}
+
+	legacy := s.Open(at(t0, 10*time.Second))
+	clock.set(at(t0, 20*time.Second))
+	if !overlaps(&s, at(t0, 15*time.Second), at(t0, 16*time.Second)) {
+		t.Fatal("a span opened with Open does not reach the horizon")
+	}
+	if overlaps(&s, at(t0, 21*time.Second), time.Now()) {
+		t.Fatal("a span opened with Open reaches past the horizon")
+	}
+	legacy()
+	clock.set(at(t0, time.Hour))
+	if overlaps(&s, at(t0, 21*time.Second), time.Now()) {
+		t.Fatal("Open's closer did not end its span at the horizon")
+	}
+	if !overlaps(&s, at(t0, 19*time.Second), at(t0, 19*time.Second)) {
+		t.Fatal("Open's closer ended its span before the horizon")
+	}
+
+	var nilSpans *Spans
+	nilSpans.OpenAt(t0, grace).Extend(t0) // nil-safe
+	nilSpans.OpenAt(t0, grace).Close(t0)
+	if s.OpenAt(time.Time{}, grace) != nil {
+		t.Fatal("a zero start opened a span")
+	}
+}
+
+// horizonWatermark is a watermark that tells how far its capture has got.
+type horizonWatermark struct{ to time.Time }
+
+func (horizonWatermark) Settled(_, _ string, _, _ time.Time) bool { return true }
+func (h horizonWatermark) CapturedTo() time.Time                  { return h.to }
+
+// The recording's open orphan spans extend as far as its capture has got: the
+// earliest any of its watermarks tells; the clock when none can.
+func TestSyncMockManagerCapturedTo(t *testing.T) {
+	m := New(nil)
+	if d := time.Since(m.CapturedTo()); d < 0 || d > time.Minute {
+		t.Fatalf("CapturedTo with no watermark is %v off the clock", d)
+	}
+	t0 := time.Unix(5000, 0)
+	defer m.AddWatermark(horizonWatermark{to: at(t0, 2*time.Second)})()
+	defer m.AddWatermark(horizonWatermark{to: at(t0, time.Second)})()
+	if got := m.CapturedTo(); !got.Equal(at(t0, time.Second)) {
+		t.Fatalf("CapturedTo %v, want the earliest horizon %v", got, at(t0, time.Second))
+	}
+	o := m.OpenOrphanSpan(t0, 0)
+	if ok, _ := m.WasMockOrphanedInWindow(at(t0, 500*time.Millisecond), at(t0, 600*time.Millisecond)); ok {
+		t.Fatal("a span with no traffic after its start and no grace covers what comes after it")
+	}
+	closeLegacy := m.OpenOrphanWindow(t0)
+	if ok, _ := m.WasMockOrphanedInWindow(at(t0, 900*time.Millisecond), at(t0, 950*time.Millisecond)); !ok {
+		t.Fatal("an orphan window does not reach the capture's horizon")
+	}
+	if ok, _ := m.WasMockOrphanedInWindow(at(t0, 1100*time.Millisecond), time.Now()); ok {
+		t.Fatal("an orphan window reaches past the capture's horizon, to the agent's clock")
+	}
+	closeLegacy()
+	o.Close(t0)
 }

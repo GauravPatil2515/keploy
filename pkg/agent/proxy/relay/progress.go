@@ -180,6 +180,46 @@ func (t *tee) directionState() string {
 	return fmt.Sprintf("%s: %s, parser took %d of %d bytes", t.dir, where, consumed, t.acceptedBytes())
 }
 
+// LastCaptured is the stamp of the newest chunk this connection carried, in
+// either direction, whether its tee queued it or not; when it has carried
+// none, when the relay was built. It is the capture's clock for the
+// connection: what it had carried by a moment is everything stamped up to it.
+// A stop is dated by it (supervisor.Session.CaptureClock).
+func (r *Relay) LastCaptured() time.Time {
+	last := max(r.teeC2D.progress.last.Load(), r.teeD2C.progress.last.Load())
+	if last == 0 {
+		return time.Unix(0, r.created)
+	}
+	return time.Unix(0, last)
+}
+
+// CapturedTo is how far the capture of this connection has got: every chunk
+// it carried stamped up to the time returned has been read, stamped and told
+// of (OnCapture). A forwarder blocked on its socket has got to now, and so has
+// one holding a chunk it has stamped (it told of it first: one blocked writing
+// to a peer that does not read holds a chunk it has told of, and reads nothing
+// more until the write completes). Only a chunk still being stamped holds it
+// back, to the stamp before it. The clock is read before the hands: a chunk
+// either forwarder picks up after the read is stamped no earlier.
+func (r *Relay) CapturedTo() time.Time {
+	to := time.Now().UnixNano()
+	for _, tt := range [2]*tee{r.teeC2D, r.teeD2C} {
+		if tt.progress.held.Load() != heldUnstamped {
+			continue
+		}
+		// Being stamped: no earlier than the newest chunk before it, or,
+		// before any, than the relay.
+		last := tt.progress.last.Load()
+		if last == 0 {
+			last = r.created
+		}
+		if last < to {
+			to = last
+		}
+	}
+	return time.Unix(0, to)
+}
+
 // carriedNothingIn reports whether this connection carried no byte stamped
 // within [start, end]: its first chunk came after end, or its newest before
 // start with none in the forwarders' hands.

@@ -156,6 +156,15 @@ type Config struct {
 	// back, so the other direction's later capture is teed first.
 	beforeTee func(fakeconn.Direction)
 
+	// OnCapture, when non-nil, is told the stamp (ReadAt) of every chunk the
+	// relay reads, in either direction, as it is stamped: before its bytes
+	// are written on, and whether the tee queues it, refuses it or a pause
+	// stashes it. It is the connection's traffic on the capture's clock: the
+	// dispatcher follows a connection that stopped being recorded with it
+	// (syncMock.UnrecordedConn). It runs on the forwarder's goroutine, for
+	// every chunk, so it must be cheap and must not block.
+	OnCapture func(at time.Time)
+
 	// ReaderLag, when positive, delivers each captured chunk to its parser
 	// no earlier than this long after the relay read it: the parser then runs
 	// that far behind the traffic, as a starved agent's does, while the

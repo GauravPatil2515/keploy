@@ -1218,3 +1218,72 @@ func TestAResetStreamIsLeftOutWithItsOwnNextStep(t *testing.T) {
 		t.Errorf("the WARN's next_step is %v, want the reset's", got)
 	}
 }
+
+// P20: a connection's stop is dated on the capture's clock (CaptureClock: the
+// stamp of the newest chunk it carried), not when the agent gets to it. A
+// parser ten seconds behind its traffic that stops on an exchange spans it up
+// to the last chunk the connection carried, which also starts the span of what
+// it carries after; dated by the agent's clock both would start ten seconds
+// late, and the first would cover everything any connection carried in those
+// ten seconds.
+func TestStoppedAtIsTheCapturesClock(t *testing.T) {
+	prev := leftOutWarns
+	t.Cleanup(func() { leftOutWarns = prev })
+	leftOutWarns = NewWarnLimiters(leftOutWarnEvery)
+	wire := time.Now().Add(-10 * time.Second) // the exchange, ten seconds ago
+	last := wire.Add(20 * time.Millisecond)   // the last chunk the connection carried
+	spans := &rawSpans{}
+	var opened time.Time
+	s := &Session{Orphans: spans, Mgr: syncMock.New(nil), Logger: zap.NewNop(),
+		CaptureClock: func() time.Time { return last },
+		OnStop:       func(at time.Time) { opened = at }}
+
+	s.ReportStoppedOn(models.HTTP, wire, "http decode error: x")
+	if got := s.StoppedAt(); !got.Equal(last) {
+		t.Fatalf("the stop is %v, want the stamp of the last chunk the connection carried (%v), not the agent's clock", got, last)
+	}
+	if len(spans.got) != 1 || !spans.got[0][0].Equal(wire) || !spans.got[0][1].Equal(last) {
+		t.Fatalf("the exchange is spanned over %v, want [%v, %v]", spans.got, wire, last)
+	}
+	if !opened.Equal(last) {
+		t.Fatalf("the span after the stop opens at %v, want the stop's stamp %v", opened, last)
+	}
+
+	// A capture clock with nothing to tell leaves the agent's clock.
+	before := time.Now()
+	s2 := &Session{CaptureClock: func() time.Time { return time.Time{} }}
+	if got := s2.StoppedAt(); got.Before(before.Round(0)) {
+		t.Fatalf("with no capture stamp the stop is %v, want the clock (after %v)", got, before)
+	}
+}
+
+// OpenOrphanSpan opens a span on the capture's clock where the session's spans
+// go: the manager's, or Orphans' (OpenAt when it can; Open otherwise).
+func TestOpenOrphanSpanRoutesAsOpenOrphanWindow(t *testing.T) {
+	t0 := time.Now().Add(-time.Hour)
+	mgr := syncMock.New(nil)
+	s := &Session{Mgr: mgr}
+	sp := s.OpenOrphanSpan(t0, time.Millisecond)
+	sp.Extend(t0.Add(time.Second))
+	sp.Close(t0.Add(time.Second))
+	if ok, _ := mgr.WasMockOrphanedInWindow(t0.Add(500*time.Millisecond), t0.Add(500*time.Millisecond)); !ok {
+		t.Fatal("the span did not reach the manager")
+	}
+	if ok, _ := mgr.WasMockOrphanedInWindow(t0.Add(2*time.Second), time.Now()); ok {
+		t.Fatal("a span closed at its last chunk reaches past it")
+	}
+
+	own := &syncMock.Spans{}
+	s = &Session{Mgr: mgr, Orphans: own}
+	sp = s.OpenOrphanSpan(t0, time.Millisecond)
+	sp.Close(t0)
+	if closed, open := own.Counts(); closed != 1 || open != 0 {
+		t.Fatalf("Orphans holds %d closed, %d open spans; want the one, closed", closed, open)
+	}
+
+	raw := &rawSpans{}
+	s = &Session{Orphans: raw}
+	s.OpenOrphanSpan(t0, time.Millisecond).Close(t0) // Open, then its closer
+	var none *Session
+	none.OpenOrphanSpan(t0, time.Millisecond).Close(t0)
+}

@@ -201,13 +201,32 @@ func (p *Proxy) recordViaSupervisor(
 	// returns, before the stop, and is seen retired once the recording has
 	// stopped. Its span is a loss before the stop, and the session's summary
 	// counts the test cases it leaves out.
-	openSpan := func(start time.Time) func() {
+	//
+	// All of it is on the capture's clock: the relay's stamps of the chunks
+	// the connection carries (relay.Config.OnCapture), never the agent's. A
+	// stop is dated at the stamp of the last chunk the connection had carried
+	// (Session.CaptureClock), the span after it extends to each chunk it
+	// carries, it is idle once the relay has read nothing for the idle grace
+	// past its last chunk (relay.Relay.CapturedTo), and it then ends at that
+	// chunk. A parser behind its connection's traffic, by as much as the
+	// agent is starved, does not widen any of it by its lag.
+	openSpan := func(start time.Time) syncMock.CaptureSpan {
 		if svSess.RecordingStopping() {
-			return func() {}
+			return syncMock.NoSpan
 		}
-		return svSess.OpenOrphanWindow(start)
+		return svSess.OpenOrphanSpan(start, syncMock.UnrecordedIdleGrace)
 	}
-	unrecorded := syncMock.NewUnrecordedConn(openSpan, syncMock.UnrecordedIdleGrace, syncMock.UnrecordedIdleCheck)
+	// r is the relay, built below; the follower asks it how far the capture
+	// of the connection has got only once the relay runs (a stop, or a
+	// chunk, starts it).
+	var r *relay.Relay
+	capturedTo := func() time.Time {
+		if r == nil {
+			return time.Now()
+		}
+		return r.CapturedTo()
+	}
+	unrecorded := syncMock.NewUnrecordedConnOnCapture(openSpan, capturedTo, syncMock.UnrecordedIdleGrace, syncMock.UnrecordedIdleCheck)
 	defer unrecorded.End()
 	svSess.OnStop = func(at time.Time) { unrecorded.Stop(at) }
 
@@ -224,15 +243,13 @@ func (p *Proxy) recordViaSupervisor(
 		// untouched — a dest-side failure is survivable there. See
 		// relay.Config.ClientTLSFirst.
 		ClientTLSFirst: opts.UpstreamTLSVerify,
-		// Wrapped to also stamp when this connection last carried bytes.
-		// After a parser is retired the relay keeps forwarding, so this is
-		// the signal that says WHEN the dead connection was actually in
-		// use — which is what bounds the suppression window below to the
-		// periods that can really have cost a mock.
-		BumpActivity: func() {
-			sv.BumpActivity()
-			unrecorded.Note(time.Time{}) // on the wire now
-		},
+		BumpActivity:   sv.BumpActivity,
+		// Every chunk the connection carries, by its stamp. After a parser is
+		// retired the relay keeps forwarding, so this is the signal that says
+		// WHEN the dead connection was actually in use, on the capture's
+		// clock: what bounds the suppression window below to the periods
+		// that can really have cost a mock.
+		OnCapture:            unrecorded.Note,
 		OnMarkMockIncomplete: svSess.MarkMockIncomplete,
 		OnClientChunkTeed:    sv.MarkPendingWork,
 		RealCertHook:         realCertHook,
@@ -288,8 +305,11 @@ func (p *Proxy) recordViaSupervisor(
 	// saying so. See relay.Config.EndAtHole.
 	applyEndAtHole(&relayCfg, svSess, parser)
 
-	r := relay.New(relayCfg, srcConn, dstConn)
+	r = relay.New(relayCfg, srcConn, dstConn)
 
+	// A stop is dated on the capture's clock: the stamp of the newest chunk
+	// the connection had carried (Session.StoppedAt).
+	svSess.CaptureClock = r.LastCaptured
 	svSess.ClientStream = r.ClientStream()
 	svSess.DestStream = r.DestStream()
 	svSess.Directives = r.Directives()

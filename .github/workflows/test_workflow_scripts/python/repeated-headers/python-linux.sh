@@ -26,6 +26,11 @@
 # watermark, /agent/record/pending) and the agent holds each test case until
 # its mocks are in: otherwise the /login test is saved without its mock, and
 # its replay, with the upstream gone, fails.
+#
+# And once with a parser that stops behind its traffic (run_stop_lag): the
+# span of what its connection could not record ends at the last chunk that
+# connection carried (the capture's clock), so a healthy connection's test case
+# recorded inside the lag is kept.
 
 set -uo pipefail
 # Explicit `set +e`: exit codes are captured explicitly and cleanup always runs.
@@ -120,6 +125,135 @@ drive_requests() {
 # quiet bound (3s), so a stop that goes by quiet alone ends before the agent
 # has parsed the /login mock.
 PARSER_LAG=8s
+PARSER_LAG_SECONDS=8
+
+# The stopped-parser run's requests: /broken at W, whose upstream answers with
+# bytes that are not HTTP (its connection's parser stops on them, PARSER_LAG
+# later), then /login half way through that lag, on a connection of its own,
+# and the stop at once.
+drive_stop_requests() {
+    local up=0
+    for _ in $(seq 1 60); do
+        if curl -fsS --max-time 5 "http://127.0.0.1:${APP_PORT}/health" >/dev/null 2>&1; then
+            up=1
+            break
+        fi
+        sleep 1
+    done
+    if [ "$up" -ne 1 ]; then
+        echo "::error::app /health did not become ready within 60s"
+        sudo pkill -INT keploy 2>/dev/null || true
+        return 1
+    fi
+    local failed=0 out
+    out=$(curl -sS --max-time 10 -o /dev/null -w '%{http_code}' "http://127.0.0.1:${APP_PORT}/broken")
+    echo "driver: /broken -> $out"
+    [ "$out" = 502 ] || { echo "::error::/broken answered $out, want 502"; failed=1; }
+    sleep $((PARSER_LAG_SECONDS / 2))
+    out=$(curl -sS --max-time 10 -o /dev/null -w '%{http_code}' "http://127.0.0.1:${APP_PORT}/login")
+    echo "driver: /login -> $out"
+    [ "$out" = 200 ] || { echo "::error::/login answered $out, want 200"; failed=1; }
+    sudo pkill -INT keploy 2>/dev/null || true
+    return $failed
+}
+
+# run_stop_lag: every parser PARSER_LAG behind its traffic, and the parser of
+# /broken's upstream connection stops on what it gets to (PARSER_LAG after the
+# app was answered). A test case is held until the parsers of the connections
+# it used are through it, so /login's, recorded half way through that lag on a
+# healthy connection, is checked after that stop. A stop dated when the parser
+# got there (the agent's clock) spans /broken's exchange to then and leaves
+# /login out too; dated on the capture's clock it ends at the last chunk that
+# connection carried, and /login is kept. /broken's own test case is left out:
+# its mock went with the parser.
+run_stop_lag() {
+    local format=yaml_stoplag
+    echo "=================== $format ==================="
+    rm -rf keploy/ keploy.yml
+    cat > keploy.yml <<'KEPLOY_CFG'
+test:
+    globalNoise:
+        global: {"header": {"Date":[]}}
+KEPLOY_CFG
+
+    python3 upstream.py "$UPSTREAM_PORT" > "upstream_logs_${format}.txt" 2>&1 &
+    upstream_pid=$!
+    wait_for_port "$UPSTREAM_PORT" upstream || return 1
+
+    drive_stop_requests > "driver_logs_${format}.txt" 2>&1 &
+    local driver_pid=$!
+    sudo -E env PATH="$PATH" KEPLOY_DEBUG_PARSER_LAG="$PARSER_LAG" "$RECORD_BIN" record \
+        -c "python3 app.py ${APP_PORT} ${UPSTREAM_PORT}" \
+        --generateGithubActions=false > "record_logs_${format}.txt" 2>&1
+    local record_status=$?
+    echo "record exit status: $record_status"
+    if ! wait "$driver_pid"; then
+        echo "::error::the request driver failed while recording ($format)"
+        cat "driver_logs_${format}.txt"
+        tail -100 "record_logs_${format}.txt"
+        return 1
+    fi
+    cat "driver_logs_${format}.txt"
+    if grep -q 'WARNING: DATA RACE' "record_logs_${format}.txt"; then
+        echo "::error::data race detected during record ($format)"
+        tail -200 "record_logs_${format}.txt"
+        return 1
+    fi
+    if ! grep -q 'KEPLOY_DEBUG_PARSER_LAG is set' "record_logs_${format}.txt"; then
+        echo "::error::the agent did not run its parsers behind the traffic ($format)"
+        tail -100 "record_logs_${format}.txt"
+        return 1
+    fi
+    # The scenario happened: the parser stopped on /broken's exchange.
+    if ! grep -q 'a captured exchange was not recorded as a mock' "record_logs_${format}.txt"; then
+        echo "::error::the broken upstream did not stop its connection's parser ($format)"
+        tail -100 "record_logs_${format}.txt"
+        return 1
+    fi
+    if grep -qE 'stopped waiting for the keploy agent|the recording is incomplete' "record_logs_${format}.txt"; then
+        echo "::error::the stop gave up on captures the agent held from before it ($format)"
+        return 1
+    fi
+    if [ "$record_status" -ne 0 ]; then
+        echo "::error::record exited $record_status ($format)"
+        tail -100 "record_logs_${format}.txt"
+        return 1
+    fi
+
+    stop_upstream
+
+    local tests_dir=keploy/test-set-0/tests
+    if ! grep -rqs 'url: http://127.0.0.1:'"${APP_PORT}"'/login' "$tests_dir"; then
+        echo "::error::/login's test case, on a healthy connection, was left out by the span of another connection's stopped parser ($format)"
+        ls -la "$tests_dir" 2>/dev/null
+        grep -E 'orphan|left out|suppressed' "record_logs_${format}.txt" | tail -20
+        return 1
+    fi
+    if grep -rqs 'url: http://127.0.0.1:'"${APP_PORT}"'/broken' "$tests_dir"; then
+        echo "::error::/broken's test case was saved, though its mock went with its connection's parser ($format)"
+        return 1
+    fi
+
+    sudo -E env PATH="$PATH" "$REPLAY_BIN" test \
+        -c "python3 app.py ${APP_PORT} ${UPSTREAM_PORT}" --delay 5 \
+        --generateGithubActions=false > "test_logs_${format}.txt" 2>&1
+    echo "test exit status: $?"
+    local report status
+    report=$(ls keploy/reports/test-run-0/test-set-0-report.* 2>/dev/null | head -n1)
+    if [ -z "$report" ]; then
+        echo "::error::no replay report ($format)"
+        tail -100 "test_logs_${format}.txt"
+        return 1
+    fi
+    status=$(grep -m1 '^status:' "$report" | awk '{print $2}')
+    echo "replay status ($format): $status"
+    if [ "$status" != "PASSED" ]; then
+        echo "::error::replay did not pass ($format)"
+        tail -60 "test_logs_${format}.txt"
+        return 1
+    fi
+    return 0
+}
 
 run_format() {
     # mode: "" for a normal run, "lag" for the run with the capture lagging.
@@ -254,4 +388,6 @@ fi
 echo "PASS: repeated headers replay on their recorded lines"
 run_format yaml lag || exit 1
 echo "PASS: a recording whose capture lags its traffic keeps every test case and its mocks"
+run_stop_lag || exit 1
+echo "PASS: a parser that stops behind its traffic leaves out only what its own connection carried"
 exit 0
