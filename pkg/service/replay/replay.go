@@ -2724,6 +2724,10 @@ func (r *Replayer) RunTestSet(ctx context.Context, testSetID string, testRunID s
 			// is about to be marked FAILED instead of demoted to OBSOLETE, so
 			// suppressing its diffs would hand the user a red test with no
 			// explanation. Knob off (the default) is byte-identical to before.
+			// Under the proven switch strict failure is always on, so a test
+			// whose mock set diverged is never demoted: its response diff is the
+			// explanation of its FAILED verdict and must be printed
+			// (assertTestMocks is on under the switch).
 			emitFailureLogs := shouldEmitFailureLogs(mockSetMismatch, r.assertTestMocks())
 
 			switch testCase.Kind {
@@ -2872,7 +2876,7 @@ func (r *Replayer) RunTestSet(ctx context.Context, testSetID string, testRunID s
 			//     --format json — only the verdict differs.
 			//   - StrictFailure: the pre-existing veto of the OBSOLETE
 			//     demotion for a response-failing test.
-			outcome := resolveTestOutcome(testPass, mockSetMismatch, r.config.Test.NoiseStrict(), r.assertTestMocks(), r.config.Test.StrictFailure)
+			outcome := resolveTestOutcome(testPass, mockSetMismatch, r.config.Test.NoiseStrict(), r.assertTestMocks(), r.strictFailure())
 			// A template failure is never demoted to OBSOLETE.
 			outcome = keepTemplateFailure(outcome, len(templateFailures) > 0)
 			switch outcome.Log {
@@ -3746,7 +3750,7 @@ func (r *Replayer) RunTestSet(ctx context.Context, testSetID string, testRunID s
 				for _, m := range consumedMocks {
 					passingTotalConsumedMocks[m.Name] = m
 				}
-			} else if mockSetMismatch && !r.config.Test.StrictFailure && len(streamTemplateFailures) == 0 && len(streamUnconsumed) == 0 {
+			} else if mockSetMismatch && !r.strictFailure() && len(streamTemplateFailures) == 0 && len(streamUnconsumed) == 0 {
 				// A template failure is never demoted to OBSOLETE, nor is a
 				// test that left one of its test mocks unconsumed.
 				testStatus = models.TestStatusObsolete
@@ -4944,11 +4948,12 @@ func (r *Replayer) compareHTTPRespForReplay(tc *models.TestCase, actualResponse 
 			normalizeHTTPRespForReport(tc, actualResponse, originalBodySize)
 			return pass, result
 		}
-		// Skipped outright under auto-replay rather than left to the helper:
-		// this quiet pre-match exists only so the auto-pass gets its shot
-		// before failure logs are emitted, and calling the helper here as well
-		// as below would log the skip twice for the same test case.
-		if !r.config.Test.AutoReplay && r.autoPassHTTPResponseSchemaAddition(tc, actualResponse, testSetID, noiseConfig, result) {
+		// Skipped outright when the auto-pass is off (auto-replay, the proven
+		// switch) rather than left to the helper: this quiet pre-match exists
+		// only so the auto-pass gets its shot before failure logs are emitted,
+		// and calling the helper here as well as below would log the skip twice
+		// for the same test case.
+		if !r.additiveAutoPassOff() && r.autoPassHTTPResponseSchemaAddition(tc, actualResponse, testSetID, noiseConfig, result) {
 			normalizeHTTPRespForReport(tc, actualResponse, originalBodySize)
 			return true, result
 		}
@@ -5055,6 +5060,16 @@ func (r *Replayer) autoPassHTTPResponseSchemaAddition(tc *models.TestCase, actua
 	if r.config.Test.AutoReplay {
 		if qualifiesForHTTPResponseSchemaAdditionPass(result) {
 			r.logger.Info("skipping additive response-schema auto-pass during auto-replay",
+				zap.String("testcase", tc.Name),
+				zap.String("testset", testSetID))
+		}
+		return false
+	}
+	// The proven model asserts every response field: a response that gained a
+	// field is a difference like any other, and the test fails on it.
+	if provenswitch.On() {
+		if qualifiesForHTTPResponseSchemaAdditionPass(result) {
+			r.logger.Info("not auto-passing an additive response-schema change: every response field is asserted (KEPLOY_PROVEN=1)",
 				zap.String("testcase", tc.Name),
 				zap.String("testset", testSetID))
 		}
