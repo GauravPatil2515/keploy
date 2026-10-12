@@ -342,9 +342,9 @@ func (f *flushOnWrite) Write(p []byte) (int, error) {
 }
 
 func (a *Agent) HandleIncoming(w http.ResponseWriter, r *http.Request) {
-	// A recording's client holds this stream open until its stop has drained
-	// it: a stop signal waits for that (WaitForRecordingClients).
-	defer attachRecordingClient()()
+	// A recording's client that drains this stream after its stop holds it
+	// open until it has: a stop signal waits for that (holdForDrain).
+	defer holdForDrain(r)()
 	a.logger.Debug("Received request to handle incoming test cases")
 
 	// Flush headers to ensure the client gets the response immediately
@@ -784,9 +784,9 @@ func (a *Agent) HandlePending(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *Agent) HandleOutgoing(w http.ResponseWriter, r *http.Request) {
-	// A recording's client holds this stream open until its stop has drained
-	// it: a stop signal waits for that (WaitForRecordingClients).
-	defer attachRecordingClient()()
+	// A recording's client that drains this stream after its stop holds it
+	// open until it has: a stop signal waits for that (holdForDrain).
+	defer holdForDrain(r)()
 
 	a.logger.Debug("Received request to handle outgoing mocks")
 
@@ -880,9 +880,9 @@ func (a *Agent) HandleOutgoing(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *Agent) HandleMappings(w http.ResponseWriter, r *http.Request) {
-	// A recording's client holds this stream open until its stop has drained
-	// it: a stop signal waits for that (WaitForRecordingClients).
-	defer attachRecordingClient()()
+	// A recording's client that drains this stream after its stop holds it
+	// open until it has: a stop signal waits for that (holdForDrain).
+	defer holdForDrain(r)()
 	a.logger.Debug("Received request to handle mappings stream")
 	w.Header().Set("Content-Type", "application/json")
 	flusher, ok := w.(http.Flusher)
@@ -1039,7 +1039,16 @@ func (a *Agent) MakeAgentReady(w http.ResponseWriter, r *http.Request) {
 func (a *Agent) HandleGracefulShutdown(w http.ResponseWriter, r *http.Request) {
 	a.logger.Debug("Received graceful shutdown notification")
 
-	if err := a.svc.SetGracefulShutdown(r.Context()); err != nil {
+	// A recording client that holds a frame stream it drains after the stop
+	// stops the app it started before it stops the agent: what the ingress
+	// finds refusing from here is that app gone on purpose (incoming
+	// stopping.go). Any other client's app (docker compose, a k8s sidecar's)
+	// goes on running through the stop.
+	ctx := r.Context()
+	if RecordingClients() > 0 {
+		ctx = models.WithDrainsAfterStop(ctx)
+	}
+	if err := a.svc.SetGracefulShutdown(ctx); err != nil {
 		a.logger.Error("failed to set graceful shutdown flag", zap.Error(err))
 		http.Error(w, fmt.Sprintf("failed to set graceful shutdown: %v", err), http.StatusInternalServerError)
 		return
