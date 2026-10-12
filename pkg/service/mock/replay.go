@@ -16,6 +16,7 @@ import (
 	"go.keploy.io/server/v3/pkg/agent/ids"
 	"go.keploy.io/server/v3/pkg/models"
 	"go.keploy.io/server/v3/pkg/platform/coverage/report"
+	"go.keploy.io/server/v3/pkg/provenswitch"
 	"go.keploy.io/server/v3/utils"
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
@@ -234,6 +235,12 @@ func (m *mockService) Replay(ctx context.Context) (err error) {
 	// 5. Hand the agent the per-test table so the runner's /agent/scope/begin
 	//    calls can narrow the served pool per test (best-effort / optional).
 	m.pushScopeTable(ctx, name)
+	if provenswitch.On() {
+		if err := m.pushTestBegins(ctx, name); err != nil {
+			utils.LogError(m.logger, err, "keploy cannot run the tests on the clocks they were recorded on", zap.String("mock-set", name))
+			return err
+		}
+	}
 	gate := m.pushScopeGate(ctx, name, digest)
 
 	// 6. Stage the whole pool as the initial serving window (BaseTime..now, no
@@ -714,6 +721,47 @@ func (m *mockService) pushScopeTable(ctx context.Context, name string) {
 		return
 	}
 	m.logger.Info("per-test scoping enabled", zap.Int("tests", len(table)), zap.String("mock-set", name))
+}
+
+// pushTestBegins hands the agent when each test of the recording began
+// (mappings.yaml), so the agent moves the run's clock to a test's begin while
+// it is open and back to the earliest of them outside every test (design v14
+// §3.4). A recording without per-test begins gives none, and its tests run at
+// the run's start time.
+func (m *mockService) pushTestBegins(ctx context.Context, name string) error {
+	pusher, ok := m.instrumentation.(TestBeginsPusher)
+	if !ok {
+		return errors.New("this keploy's agent client cannot move the clock per test")
+	}
+	start, begins := time.Time{}, map[string]time.Time{}
+	if reader, ok := m.mappingDB.(MappingReader); ok {
+		mapping, err := reader.GetMapping(ctx, name)
+		if err != nil {
+			return fmt.Errorf("read when the tests of %s began: %w", name, err)
+		}
+		start, begins = testBegins(mapping)
+	}
+	return pusher.PushTestBegins(ctx, start, begins)
+}
+
+// testBegins is when each test of mapping began, by test ID, and the earliest
+// of them.
+func testBegins(mapping *models.Mapping) (time.Time, map[string]time.Time) {
+	var start time.Time
+	begins := map[string]time.Time{}
+	if mapping == nil {
+		return start, begins
+	}
+	for _, tc := range mapping.TestCases {
+		if tc.At.IsZero() {
+			continue
+		}
+		begins[tc.ID] = tc.At
+		if start.IsZero() || tc.At.Before(start) {
+			start = tc.At
+		}
+	}
+	return start, begins
 }
 
 // replayWindows are the per-test windows of this replay. Under docker compose

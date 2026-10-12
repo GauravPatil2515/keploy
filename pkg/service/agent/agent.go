@@ -142,8 +142,9 @@ type Agent struct {
 	workerOpen   map[scopeKey]time.Time // record: (worker PID, test name) -> begin time (agent clock)
 	scopeWindows []models.ScopeWindow   // record: closed per-test windows
 	scopeMeta    map[scopeKey]scopeMeta
-	scopeTable   map[string][]string // replay: test name -> mock names (from mappings.yaml)
-	loadedMocks  int                 // replay: count of mocks stored, for /agent/mock/stats
+	scopeTable   map[string][]string  // replay: test name -> mock names (from mappings.yaml)
+	testBegins   map[string]time.Time // replay: test name -> when it began in its recording (SetTestBegins)
+	loadedMocks  int                  // replay: count of mocks stored, for /agent/mock/stats
 	// replay: the tests allowed to run (SetScopeGate); nil = every test runs.
 	// Cleared by resetScopeState.
 	gateRun    map[string]struct{}

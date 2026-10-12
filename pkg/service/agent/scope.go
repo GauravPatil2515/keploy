@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"time"
 
@@ -69,6 +70,9 @@ func (a *Agent) BeginScopeAt(ctx context.Context, name string, pid int, at time.
 		return nil
 	}
 	if a.config != nil && a.config.Agent.Mode == models.MODE_TEST {
+		if err := a.beginTestClock(ctx, name); err != nil {
+			return fmt.Errorf("keploy could not move the clock to when %s began in its recording: %w", name, err)
+		}
 		a.openWindow(name, pid, at)
 		a.scopeMu.Lock()
 		names, ok := a.scopeTable[name]
@@ -140,6 +144,9 @@ func (a *Agent) EndScopeAt(ctx context.Context, name string, pid int, at time.Ti
 	if a.config != nil && a.config.Agent.Mode == models.MODE_TEST {
 		a.noteEndOfGated(name, pid)
 		a.closeWindow(name, pid, at)
+		if err := a.endTestClock(ctx, name); err != nil {
+			return fmt.Errorf("keploy could not move the clock back after %s: %w", name, err)
+		}
 		a.scopeMu.Lock()
 		_, scoped := a.scopeTable[name]
 		a.scopeMu.Unlock()

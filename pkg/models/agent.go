@@ -235,6 +235,16 @@ type ScopeTableReq struct {
 	Sets     map[string]SetTable `json:"sets,omitempty"`
 }
 
+// TestBeginsReq is the body of POST /agent/scope/clock: when each test of the
+// replayed recording began (MappedTestCase.At), by test name. Under the proven
+// switch the agent moves the clock of the run's processes to a test's begin
+// while the test is open, and back to the run's start time after it (design
+// v14 §3.4). Start is the earliest of them: the run's clock outside every test.
+type TestBeginsReq struct {
+	Start  time.Time            `json:"start,omitzero"`
+	Begins map[string]time.Time `json:"begins"`
+}
+
 type SetTable struct {
 	Boots  map[string][]string `json:"boots,omitempty"`
 	Tests  map[string][]Owned  `json:"tests,omitempty"`

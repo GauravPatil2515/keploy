@@ -2250,6 +2250,7 @@ func (p *Proxy) handleConnection(ctx context.Context, srcConn net.Conn) error {
 		utils.LogError(p.logger, err, "failed to delete the destination info", zap.Int("Source port", sourcePort))
 		return err
 	}
+	seeProcess(destInfo.KernelPid)
 
 	var dstAddr string
 
@@ -4566,6 +4567,7 @@ func (p *Proxy) serveTreeListener(ctx context.Context, srcConn net.Conn, dest *a
 		p.logger.Debug("the destination is not a process the test command started", zap.String("destination", dstAddr), zap.Int("owner", owner), zap.Bool("listening", listening))
 		return false, nil
 	}
+	seeProcess(pidToUint32(owner))
 	if starts.Default.Dependency(pidToUint32(owner)) {
 		p.logger.Debug("the destination is a dependency the tests started; recording and serving it as mocks", zap.String("destination", dstAddr), zap.Int("owner", owner))
 		starts.Default.Child(conn)

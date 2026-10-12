@@ -340,5 +340,35 @@ SAID=$(grep -c "INFO.*self-call passed through to the run's own listener" self.l
 grep -qE "self-calls passed through to the run's own listeners.*\"calls\": 5" self.log ||
   { echo "FAIL: the run's 5 self-calls were not counted when it ended"; FAIL=1; }
 
+echo "== 6. under the proven switch, a record keeps when each test began, and a replay hands it to the agent =="
+# The agent moves the run's clock to each test's recorded begin while the test
+# is open (design v14 §3.4); a build that freezes the clock does the moving,
+# so here the begins are checked on disk and on the agent's way in.
+grep -qE '^\s+at: ' keploy/e2e/mappings.yaml && { echo "FAIL: a record without the proven switch wrote test begins"; FAIL=1; }
+DEP_PID=$(start_dep); sleep 1
+sudo -E env PATH="$PATH" KEPLOY_PROVEN=1 "$RECORD_BIN" mock record -c "python3 -m pytest -q -p no:cacheprovider test_api.py" --name e2e-proven --disable-tele 2>&1 | tee rec-proven.log
+stop_dep "$DEP_PID"
+python3 - <<'PY' || FAIL=1
+import datetime, re, sys
+t = open("keploy/e2e-proven/mappings.yaml").read()
+begins = {}
+for block in re.split(r"\n(?=\s*- id: )", t):
+    m = re.search(r"- id: (\S+)", block)
+    a = re.search(r"\n\s+at: (\S+)", block)
+    if m and a:
+        begins[m.group(1)] = datetime.datetime.fromisoformat(a.group(1).replace("Z", "+00:00"))
+print("recorded begins:", begins)
+want = {"test_users", "test_items", "test_health"}
+if set(begins) != want:
+    sys.exit(f"FAIL: want a recorded begin for each of {sorted(want)}, got {sorted(begins)}")
+order = [n for n, _ in sorted(begins.items(), key=lambda kv: kv[1])]
+if order != ["test_users", "test_items", "test_health"]:
+    sys.exit(f"FAIL: the begins are not in the order the tests ran: {order}")
+PY
+sudo -E env PATH="$PATH" KEPLOY_PROVEN=1 "$REPLAY_BIN" mock replay -c "python3 -m pytest -q -p no:cacheprovider test_api.py" --name e2e-proven --disable-tele 2>&1 | tee rep-proven.log
+RC=${PIPESTATUS[0]}
+[ "$RC" -eq 0 ] && grep -q "3 passed" rep-proven.log || { echo "FAIL: the proven replay should pass from mocks (exit 0, 3 passed), got $RC"; FAIL=1; }
+grep -q "cannot run the tests on the clocks they were recorded on" rep-proven.log && { echo "FAIL: the agent did not take the tests' recorded begins"; FAIL=1; }
+
 if [ "$FAIL" -eq 0 ]; then echo "MOCK E2E: PASSED"; else echo "MOCK E2E: FAILED"; fi
 exit "$FAIL"

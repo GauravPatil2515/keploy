@@ -114,6 +114,10 @@ type MappedTestCase struct {
 	CaseSteps map[string]string   `json:"case_steps,omitempty" yaml:"case_steps,omitempty" bson:"case_steps,omitempty"`
 	Dir       string              `json:"dir,omitempty" yaml:"dir,omitempty" bson:"dir,omitempty"`
 	Starts    int                 `json:"starts,omitempty" yaml:"starts,omitempty" bson:"starts,omitempty"`
+	// At is when the test began in its recording: the clock its replay runs
+	// on while it is open (design v14 §3.4). Zero in recordings made before
+	// keploy kept it, and in those made without the proven switch.
+	At time.Time `json:"at,omitzero" yaml:"at,omitempty" bson:"at,omitempty"`
 }
 
 type persistedTestFormat struct {
@@ -124,6 +128,7 @@ type persistedTestFormat struct {
 	CaseSteps   map[string]string   `json:"case_steps,omitempty" yaml:"case_steps,omitempty"`
 	Dir         string              `json:"dir,omitempty" yaml:"dir,omitempty"`
 	Starts      int                 `json:"starts,omitempty" yaml:"starts,omitempty"`
+	At          time.Time           `json:"at,omitzero" yaml:"at,omitempty"`
 }
 
 type structuredTestFormat struct {
@@ -265,17 +270,18 @@ func (tc MappedTestCase) persistedFormat() persistedTestFormat {
 		CaseSteps:   tc.CaseSteps,
 		Dir:         tc.Dir,
 		Starts:      tc.Starts,
+		At:          tc.At,
 	}
 }
 
 func (tc *MappedTestCase) extras(p persistedTestFormat) {
-	tc.CaseMocks, tc.CaseSteps, tc.Dir, tc.Starts = p.CaseMocks, p.CaseSteps, p.Dir, p.Starts
+	tc.CaseMocks, tc.CaseSteps, tc.Dir, tc.Starts, tc.At = p.CaseMocks, p.CaseSteps, p.Dir, p.Starts, p.At
 }
 
 func (tc *MappedTestCase) applyDecodedMocks(id string, mockEntries []MockEntry, legacyMocks string, cases []string) {
 	tc.ID = id
 	tc.Cases = append([]string(nil), cases...)
-	tc.CaseMocks, tc.CaseSteps, tc.Dir, tc.Starts = nil, nil, "", 0
+	tc.CaseMocks, tc.CaseSteps, tc.Dir, tc.Starts, tc.At = nil, nil, "", 0, time.Time{}
 	tc.Mocks = nil
 	if len(mockEntries) > 0 {
 		tc.Mocks = append([]MockEntry(nil), mockEntries...)
