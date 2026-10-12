@@ -210,8 +210,9 @@ KEPLOY_CFG
         tail -100 "record_logs_${format}.txt"
         return 1
     fi
-    if grep -qE 'stopped waiting for the keploy agent|the recording is incomplete' "record_logs_${format}.txt"; then
-        echo "::error::the stop gave up on captures the agent held from before it ($format)"
+    if grep -qE 'stopped waiting for the keploy agent|the recording (is|may be) incomplete|the keploy agent ended its (mapping )?stream' "record_logs_${format}.txt"; then
+        echo "::error::the stop did not save all the agent held from before it ($format)"
+        grep -E 'stopped waiting for the keploy agent|the recording (is|may be) incomplete|the keploy agent ended its (mapping )?stream' "record_logs_${format}.txt"
         return 1
     fi
     if [ "$record_status" -ne 0 ]; then
