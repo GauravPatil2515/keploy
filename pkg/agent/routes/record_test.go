@@ -1,7 +1,10 @@
 package routes
 
 import (
+	"context"
+	"encoding/gob"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -9,7 +12,10 @@ import (
 	"strings"
 	"testing"
 
+	"go.keploy.io/server/v3/pkg/agent/containerkey"
 	pTls "go.keploy.io/server/v3/pkg/agent/proxy/tls"
+	"go.keploy.io/server/v3/pkg/models"
+	"go.keploy.io/server/v3/pkg/service/agent"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest"
 )
@@ -146,5 +152,64 @@ func TestMakeAgentReady_NoReadinessFileOn503(t *testing.T) {
 	}
 	if _, err := os.Stat(readyFile); err != nil {
 		t.Fatalf("after CA ready: expected agent.ready on disk: %v", err)
+	}
+}
+
+// outgoingSvc streams the mocks it was given, then ends the stream.
+type outgoingSvc struct {
+	agent.Service
+	mocks []*models.Mock
+}
+
+func (s *outgoingSvc) GetOutgoing(context.Context, models.OutgoingOptions) (<-chan *models.Mock, error) {
+	ch := make(chan *models.Mock, len(s.mocks))
+	for _, m := range s.mocks {
+		ch <- m
+	}
+	close(ch)
+	return ch, nil
+}
+
+// streamOutgoing runs HandleOutgoing over mocks and decodes what it sent.
+func streamOutgoing(t *testing.T, mocks ...*models.Mock) []*models.Mock {
+	t.Helper()
+	a := &Agent{logger: zap.NewNop(), svc: &outgoingSvc{mocks: mocks}}
+	rec := httptest.NewRecorder()
+	a.HandleOutgoing(rec, httptest.NewRequest(http.MethodPost, "/agent/outgoing", strings.NewReader(`{}`)))
+	dec := gob.NewDecoder(rec.Body)
+	var out []*models.Mock
+	for {
+		var m models.Mock
+		if err := dec.Decode(&m); err != nil {
+			if !errors.Is(err, io.EOF) {
+				t.Fatalf("decode the stream: %v", err)
+			}
+			return out
+		}
+		out = append(out, &m)
+	}
+}
+
+// A recorded mock of a container connection carries the container's key
+// under the proven switch, and nothing new without it.
+func TestHandleOutgoingStampsContainerKeys(t *testing.T) {
+	k := useKeyer(t)
+	_, key, _ := k.Name(context.Background(), zap.NewNop(), "11", "127.0.0.1:49153")
+
+	t.Setenv("KEPLOY_PROVEN", "1")
+	got := streamOutgoing(t,
+		&models.Mock{Kind: models.HTTP, ConnectionID: "11"},
+		&models.Mock{Kind: models.HTTP, ConnectionID: "12"})
+	if len(got) != 2 || got[0].Spec.Metadata[containerkey.MetadataKey] != key || key == "" {
+		t.Fatalf("container connection's mock = %+v, want key %q", got, key)
+	}
+	if _, ok := got[1].Spec.Metadata[containerkey.MetadataKey]; ok {
+		t.Fatalf("another connection's mock was stamped: %v", got[1].Spec.Metadata)
+	}
+
+	t.Setenv("KEPLOY_PROVEN", "")
+	got = streamOutgoing(t, &models.Mock{Kind: models.HTTP, ConnectionID: "11"})
+	if len(got) != 1 || got[0].Spec.Metadata[containerkey.MetadataKey] != "" {
+		t.Fatalf("switch off: the mock was stamped: %+v", got)
 	}
 }

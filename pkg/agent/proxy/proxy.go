@@ -26,6 +26,7 @@ import (
 	expirable "github.com/hashicorp/golang-lru/v2/expirable"
 	"go.keploy.io/server/v3/config"
 	"go.keploy.io/server/v3/pkg/agent"
+	"go.keploy.io/server/v3/pkg/agent/containerkey"
 	"golang.org/x/sync/errgroup"
 
 	"go.keploy.io/server/v3/pkg/agent/proxy/cbshim"
@@ -37,6 +38,7 @@ import (
 	"go.keploy.io/server/v3/pkg/agent/starts"
 	"go.keploy.io/server/v3/pkg/models"
 	"go.keploy.io/server/v3/pkg/neterr"
+	"go.keploy.io/server/v3/pkg/provenswitch"
 	"go.keploy.io/server/v3/utils"
 	"go.uber.org/zap"
 )
@@ -2272,6 +2274,14 @@ func (p *Proxy) handleConnection(ctx context.Context, srcConn net.Conn) error {
 		return p.serveWithoutSession(ctx, srcConn, dstAddr, predialed)
 	}
 
+	// The proven model names a container destination by its container key,
+	// not by the address it was reached at (containerkey): resolved once,
+	// here, in the scope open now, and kept for the connection's life.
+	var containerKey string
+	if provenswitch.On() {
+		_, containerKey, _ = containerkey.Default.Name(ctx, p.logger, fmt.Sprint(clientConnID), dstAddr)
+	}
+
 	// Create a local copy of OutgoingOptions to avoid data race when multiple
 	// goroutines handle connections concurrently and modify DstCfg/Synchronous
 	outgoingOpts := rule.OutgoingOptions
@@ -2312,6 +2322,7 @@ func (p *Proxy) handleConnection(ctx context.Context, srcConn net.Conn) error {
 	parserCtx = context.WithValue(parserCtx, models.ErrGroupKey, parserErrGrp)
 	parserCtx = context.WithValue(parserCtx, models.ClientConnectionIDKey, fmt.Sprint(clientConnID))
 	parserCtx = context.WithValue(parserCtx, models.DestConnectionIDKey, fmt.Sprint(destConnID))
+	parserCtx = containerkey.WithKey(parserCtx, containerKey)
 	parserCtx, parserCtxCancel := context.WithCancel(parserCtx)
 
 	// Capture the initial srcConn before it gets reassigned (TLS upgrade, wrapping).
@@ -3647,6 +3658,7 @@ func (p *Proxy) loadUpstreamTLSTrustAnchors() {
 
 func (p *Proxy) Record(ctx context.Context, mocks chan<- *models.Mock, opts models.OutgoingOptions) error {
 	recorded.reset()
+	containerkey.Default.Reset()
 	// Reconcile the two mock-noise spellings on receipt. This is the process
 	// boundary: opts arrives over the agent API from a client that may predate
 	// the schema-noise -> mock-noise rename and therefore sets only the
@@ -3701,6 +3713,7 @@ func (p *Proxy) Record(ctx context.Context, mocks chan<- *models.Mock, opts mode
 
 func (p *Proxy) Mock(_ context.Context, opts models.OutgoingOptions) error {
 	recorded.reset()
+	containerkey.Default.Reset()
 	// Reconcile the two mock-noise spellings on receipt. This is the process
 	// boundary: opts arrives over the agent API from a client that may predate
 	// the schema-noise -> mock-noise rename and therefore sets only the

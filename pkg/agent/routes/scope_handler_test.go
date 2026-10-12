@@ -3,8 +3,10 @@ package routes
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"slices"
 	"strings"
 	"testing"
@@ -12,6 +14,7 @@ import (
 
 	"go.uber.org/zap"
 
+	"go.keploy.io/server/v3/pkg/agent/containerkey"
 	"go.keploy.io/server/v3/pkg/agent/starts"
 	"go.keploy.io/server/v3/pkg/models"
 	"go.keploy.io/server/v3/pkg/service/agent"
@@ -319,5 +322,70 @@ func TestScopeTableAnchorsTheClockAtTheFirstSuiteStart(t *testing.T) {
 	post(t, a.HandleScopeTable, `{"sets":{"a":{}}}`)
 	if len(h.got) != 1 {
 		t.Fatalf("anchored without a suite start: %v", h.got)
+	}
+}
+
+// oneContainer resolves every destination to one postgres container per
+// destination port.
+type oneContainer struct{}
+
+func (oneContainer) Resolve(_ context.Context, dst netip.AddrPort) (containerkey.Container, bool, error) {
+	return containerkey.Container{ID: fmt.Sprint(dst.Port()), Image: "postgres:16", Port: 5432}, true, nil
+}
+
+func (oneContainer) Endpoint() string { return "unix:///fake.sock" }
+
+func useKeyer(t *testing.T) *containerkey.Keyer {
+	t.Helper()
+	saved := containerkey.Default
+	containerkey.Default = containerkey.NewKeyer(oneContainer{})
+	t.Cleanup(func() { containerkey.Default = saved })
+	return containerkey.Default
+}
+
+func keyOf(t *testing.T, k *containerkey.Keyer, dst string) string {
+	t.Helper()
+	_, key, _ := k.Name(context.Background(), zap.NewNop(), "", dst)
+	return key
+}
+
+// Under the proven switch a test's begin opens its own numbering of
+// container destinations, and its end goes back to the run's: the suite's
+// container keeps #1 and each test's own container is #2.
+func TestScopeHandlersOpenAndCloseTheContainerNumbering(t *testing.T) {
+	t.Setenv("KEPLOY_PROVEN", "1")
+	k := useKeyer(t)
+	a := &Agent{logger: zap.NewNop(), svc: &timedScopeSvc{}}
+
+	if got := keyOf(t, k, "127.0.0.1:40001"); got != "container:postgres:16:5432#1" {
+		t.Fatalf("suite container = %q", got)
+	}
+	for _, test := range []struct{ name, dst string }{{"TestA", "127.0.0.1:40002"}, {"TestB", "127.0.0.1:40003"}} {
+		post(t, a.HandleScopeBegin, `{"name":"`+test.name+`"}`)
+		if got := keyOf(t, k, test.dst); got != "container:postgres:16:5432#2" {
+			t.Fatalf("%s's own container = %q", test.name, got)
+		}
+		post(t, a.HandleScopeEnd, `{"name":"`+test.name+`","outcome":"passed"}`)
+	}
+	// The run numbers on from its own: the tests' containers are not its.
+	if got := keyOf(t, k, "127.0.0.1:40004"); got != "container:postgres:16:5432#2" {
+		t.Fatalf("outside tests after them = %q, want the run's next number", got)
+	}
+
+	// An app start (a suite scope) is not a test.
+	post(t, a.HandleScopeBegin, `{"name":"app","suite":true}`)
+	if got := keyOf(t, k, "127.0.0.1:40005"); got != "container:postgres:16:5432#3" {
+		t.Fatalf("inside a suite scope = %q, want the run's numbering", got)
+	}
+}
+
+func TestScopeHandlersLeaveContainerNumberingAloneWithoutTheSwitch(t *testing.T) {
+	t.Setenv("KEPLOY_PROVEN", "")
+	k := useKeyer(t)
+	a := &Agent{logger: zap.NewNop(), svc: &timedScopeSvc{}}
+	_ = keyOf(t, k, "127.0.0.1:40001")
+	post(t, a.HandleScopeBegin, `{"name":"TestA"}`)
+	if got := keyOf(t, k, "127.0.0.1:40002"); got != "container:postgres:16:5432#2" {
+		t.Fatalf("with the switch off a begin opened a test scope: %q", got)
 	}
 }

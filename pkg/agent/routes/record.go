@@ -18,6 +18,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/render"
+	"go.keploy.io/server/v3/pkg/agent/containerkey"
 	"go.keploy.io/server/v3/pkg/agent/hooks/conn"
 	syncmgr "go.keploy.io/server/v3/pkg/agent/proxy/syncMock"
 	pTls "go.keploy.io/server/v3/pkg/agent/proxy/tls"
@@ -815,6 +816,9 @@ func (a *Agent) HandleOutgoing(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			starts.Default.Stamp(m)
+			if provenswitch.On() {
+				containerkey.Default.Stamp(m)
+			}
 			if err := enc.Encode(m); err != nil {
 				// enc.Encode(m) folds two distinct failure modes into
 				// one error: (a) per-mock serialization errors (an

@@ -10,16 +10,19 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"errors"
+	"fmt"
 	"io"
 	"math/big"
 	"net"
 	"net/http"
+	"net/netip"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"go.keploy.io/server/v3/config"
 	"go.keploy.io/server/v3/pkg/agent"
+	"go.keploy.io/server/v3/pkg/agent/containerkey"
 	"go.keploy.io/server/v3/pkg/agent/proxy/connseq"
 	syncMock "go.keploy.io/server/v3/pkg/agent/proxy/syncMock"
 	"go.keploy.io/server/v3/pkg/agent/proxy/util"
@@ -731,5 +734,80 @@ func TestHandleConnectionClosesTheTunnelWhenTheAppLeavesBeforeUsingIt(t *testing
 	}
 	if src.closes.Load() == 0 {
 		t.Fatal("handleConnection returned without closing the application's connection")
+	}
+}
+
+// containerAt names one address a container, as Docker would for a
+// container's published port.
+type containerAt struct {
+	addr string
+	c    containerkey.Container
+}
+
+func (r containerAt) Resolve(_ context.Context, dst netip.AddrPort) (containerkey.Container, bool, error) {
+	return r.c, dst.String() == r.addr, nil
+}
+
+func (containerAt) Endpoint() string { return "unix:///fake.sock" }
+
+// Under the proven switch the proxy names a container destination when it
+// accepts the connection, under the connection ID its mocks carry, so the
+// recorded mock is stamped with the container's key; without the switch it
+// asks nothing.
+func TestHandleConnectionNamesAContainerDestination(t *testing.T) {
+	for _, on := range []bool{true, false} {
+		t.Run(fmt.Sprintf("proven=%v", on), func(t *testing.T) {
+			if on {
+				t.Setenv("KEPLOY_PROVEN", "1")
+			} else {
+				t.Setenv("KEPLOY_PROVEN", "")
+			}
+			upstream := keepAliveHTTPUpstream(t)
+			saved := containerkey.Default
+			containerkey.Default = containerkey.NewKeyer(containerAt{addr: upstream,
+				c: containerkey.Container{ID: "c1", Image: "localstack/localstack:3.8", Port: 4566}})
+			t.Cleanup(func() { containerkey.Default = saved })
+
+			cfg := config.New()
+			cfg.Agent.Mode = models.MODE_RECORD
+			p := New(zap.NewNop(), fakeDestInfo{dest: ipv4Dest(t, upstream)}, cfg)
+			if err := p.InitIntegrations(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { syncMock.Get().SetOutputChannel(nil) })
+			mocks := make(chan *models.Mock, 16)
+			if err := p.Record(context.Background(), mocks, models.OutgoingOptions{DisableMysqlAutoDetect: true}); err != nil {
+				t.Fatal(err)
+			}
+
+			app, src := acceptedConn(t)
+			done := make(chan error, 1)
+			go func() { done <- p.handleConnection(context.Background(), src) }()
+			if body := awaitEvent(t, get(app, bufio.NewReader(app), "/queue", true), "the call"); body != "/queue" {
+				t.Fatalf("the call got %q", body)
+			}
+			_ = app.Close()
+			recorded := make(chan *models.Mock, 1)
+			go func() {
+				for m := range mocks {
+					if m.Spec.HTTPReq != nil {
+						recorded <- m
+						return
+					}
+				}
+			}()
+			m := awaitEvent(t, recorded, "the call's mock")
+			awaitEvent(t, done, "handleConnection returning")
+
+			containerkey.Default.Stamp(m)
+			got := m.Spec.Metadata[containerkey.MetadataKey]
+			want := ""
+			if on {
+				want = "container:localstack/localstack:3.8:4566#1"
+			}
+			if got != want {
+				t.Fatalf("the mock's container key = %q, want %q (metadata %v)", got, want, m.Spec.Metadata)
+			}
+		})
 	}
 }
